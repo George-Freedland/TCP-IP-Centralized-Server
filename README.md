@@ -5,4 +5,4 @@ Description: A functional Client-Server Centralized Network that provides messag
 #
 Python version: 3.8.4 (64-bit version) 
 #
-In the future I want to develop a broadcast method for the server to broadcast a message to all the clients at the same time.
+In the future will work on developing a broadcast method for the server to send a message to all clients at the same time.
