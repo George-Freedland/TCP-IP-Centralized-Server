@@ -21,7 +21,15 @@ sending direct messages, reading your messages, creating/joining chat rooms, and
   receiver always reads exactly one complete message. This prevents messages
   from being split or merged on the TCP stream (a common source of bugs when
   reading a fixed number of bytes).
-- The server spawns one thread per connected client (up to `MAX_NUM_CONN`).
+- The server spawns one thread per connected client (up to `MAX_NUM_CONN`) and
+  serializes all writes to a socket with a per-connection lock.
+- **Real-time delivery:** the client runs a background *receiver thread* that
+  is always listening. When the server pushes a message (a chat line, a
+  broadcast, or a direct message), it appears immediately — the client clears
+  the current prompt, prints the incoming message, and restores whatever you
+  were typing so you can keep going.
+- The server logs every event on a single timestamped line (e.g.
+  `[20:54:37] Alice created chat room 100`), so the console is easy to scan.
 
 ## Running locally
 
@@ -39,10 +47,10 @@ The server binds to `0.0.0.0:12000` and prints the addresses clients can use,
 for example:
 
 ```
-Server is starting....
-Clients on this machine can connect using IP 127.0.0.1 and port 12000
-Clients on your LAN can connect using IP 192.168.x.x and port 12000
-Listening at  192.168.x.x / 12000
+[20:54:36] Server is starting....
+[20:54:36] Clients on this machine can connect using IP 127.0.0.1 and port 12000
+[20:54:36] Clients on your LAN can connect using IP 192.168.x.x and port 12000
+[20:54:36] Listening at 192.168.x.x:12000
 ```
 
 ### 2. Start one or more clients
@@ -61,6 +69,10 @@ You'll be prompted for connection details:
 - **Server port:** `12000`
 - **Your id key (i.e. your name):** any display name, e.g. `Alice`
 
+If the address or port is wrong, the client gives up after **30 seconds** (or
+sooner if the connection is refused) with a message explaining why, instead of
+hanging forever.
+
 Run `python3 client.py` again in more terminals to connect additional clients
 and try messaging/broadcasting between them.
 
@@ -68,18 +80,27 @@ and try messaging/broadcasting between them.
 
 Once connected, each client sees:
 
-1. **Get user list** – list everyone currently connected.
-2. **Send a message** – send a direct message to another user by their id.
+1. **Get user list** – list everyone currently connected (with their ids).
+2. **Send a message** – send a direct message to another user by their id. It's
+   delivered to them **in real time** if they're online, and also stored so they
+   can read it later with option 3.
 3. **Get my messages** – read (and clear) your unread direct messages.
-4. **Create a new chat room** – open a room others can join.
-5. **Join an existing chat room** – join a room by id.
-6. **Broadcast a message to all users** – send one message to every connected
+4. **Create a new chat room** – open a room others can join, then start chatting.
+5. **Join an existing chat room** – join a room by id and chat in real time.
+6. **Broadcast a message to all users** – push one message to every connected
    client at the same time (prefixed with `[BROADCAST]`).
 7. **Disconnect from server** – cleanly leave the server.
 
+### Chat rooms
+
+- Create (option 4) or join (option 5) a room, then just type and press Enter to
+  send. Messages from other members show up live.
+- A room stays open as long as at least one member is in it. Type `exit` or `bye`
+  to leave; when the last member leaves, the room is removed automatically.
+
 ## Notes
 
-- Because the protocol is request/response, a broadcast is delivered to other
-  clients the next time they interact with the server (best-effort), and always
-  to the sender immediately as confirmation.
+- Broadcasts, direct messages, and chat lines are pushed to other clients
+  instantly; the receiving client interrupts its current prompt to show the
+  message and then restores what you were typing.
 - To stop the server, press `Ctrl+C` in its terminal.

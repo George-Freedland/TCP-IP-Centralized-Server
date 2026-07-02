@@ -2,17 +2,25 @@
 # File:             server.py
 # Author:           George Freedland
 # Purpose:          CSC645 Assigment #1 TCP socket programming
-# Description:      Template server class.
-# Running:          Python 2: python server.py
-#                   Python 3: python3 server.py
+# Description:      Multithreaded TCP chat/messaging server.
+# Running:          python3 server.py
 #                   Note: Must run the server before the client.
 ########################################################################
 
 import socket
 import struct
-from threading import Thread, active_count
+import logging
 import pickle
+from threading import Thread, Lock, active_count
 from client_handler import ClientHandler
+
+# Timestamped, single-line logging so the server console is easy to scan.
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(message)s',
+    datefmt='%H:%M:%S',
+)
+log = logging.getLogger('server')
 
 PORT = 12000
 # Bind to all interfaces so the server is reachable via 127.0.0.1 and the
@@ -53,16 +61,18 @@ class Server(object):
         self.port = port
         self.numOfClients = 0
         self.connected = True
-        self.clientName = None
-        self.clientRequest = None
-        # dictionary of clients handlers objects handling clients. format {clientid:connobject}
+        # dictionary of client connections. format {clientid: connobject}
         self.clientHandlerObjects = {}
-        # dictionary of client names. format {clientid:clientName}
+        # dictionary of client names. format {clientid: clientName}
         self.clientNames = {}
-        # Format: {who it was sent to:(messagecontent:sentfrom)}
+        # store-and-forward mailbox for direct messages
         self.unreadMessages = []
         # Dictionary that holds open chatRooms.
         self.chatRooms = {}
+        # One lock per connection so that pushes coming from other client
+        # threads never interleave (and corrupt the framing) with the writes
+        # made by a connection's own thread. format {conn: Lock}
+        self._locks = {}
 
         # create an INET, STREAMing socket
         try:
@@ -72,26 +82,28 @@ class Server(object):
             self.serversocket.setsockopt(
                 socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except socket.error:
-            print('Error creating socket.')
+            log.error('Error creating socket.')
 
         # bind the socket to a public host, and a well-known port
         try:
             self.serversocket.bind((ip_address, port))
         except socket.error:
-            print('Error binding server to ip and port')
+            log.error('Error binding server to ip and port')
             self.serversocket.close()
+
+    def register_connection(self, conn):
+        """Create a dedicated send lock for a newly accepted connection."""
+        self._locks[conn] = Lock()
 
     # Thread Starts
     def threaded_handle_client(self, conn, addr):
         # On init this sets up variables in ClientHandler.
         # Also sends ID, gets Name then sends Ok
         client_handler = ClientHandler(self, conn, addr)
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print(f"NEW CONNECTION from {addr} had been established!")
-        print(f"Active Connections/Threads Running: {active_count() - 1}")
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        log.info(f"New connection established from {addr[0]}:{addr[1]}")
+        log.info(f"Active connections: {active_count() - 1}")
 
-        # Main recieve loop determines what to do based on the 'type'
+        # Main receive loop determines what to do based on the 'type'
         while self.connected:
             try:
                 message = self.receive(conn)
@@ -101,33 +113,23 @@ class Server(object):
             # A None message means the client closed the connection.
             if message is None:
                 self.numOfClients -= 1
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-                print(
-                    f"{self.clientNames.get(addr[1], addr[1])} has disconnected from the server.")
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+                log.info(
+                    f"{self.clientNames.get(addr[1], addr[1])} disconnected from the server")
                 break
 
-            # Give some data about the incoming message
-            print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-            print(
-                f"Incoming message from {addr}\nMessage Header: {message['header']}\nMessage Type: {message['type']}")
-            print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+            log.info(
+                f"Message from {self.clientNames.get(addr[1], addr[1])} "
+                f"({addr[1]}): type={message['type']}")
 
             # Handle get menu request
             if message['type'] == "GET" and message['content'] == "MENU":
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-                print(f"Sending menu to {addr}...")
+                log.info(f"Sending menu to {addr[1]}")
                 client_handler._sendMenu()
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
             # Handle menu option select
             if message['type'] == "MENUOPTION":
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-                print(
-                    f"Handle menu request {message['menuOption']} from {addr}...")
-                print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-                # Pass the message explicitly so concurrent clients don't
-                # clobber each other through a shared server attribute.
+                log.info(
+                    f"Handling option {message['menuOption']} for {addr[1]}")
                 client_handler.process_options(message)
                 if message['menuOption'] == self.DISCONNECT_OPTION:
                     self.numOfClients -= 1
@@ -137,6 +139,7 @@ class Server(object):
         # disconnect can't raise KeyError during cleanup).
         self.clientNames.pop(addr[1], None)
         conn_to_close = self.clientHandlerObjects.pop(addr[1], None)
+        self._locks.pop(conn, None)
         if conn_to_close is not None:
             try:
                 conn_to_close.close()
@@ -147,42 +150,50 @@ class Server(object):
     def _listen(self):
         try:
             self.serversocket.listen(self.MAX_NUM_CONN)
-            print('Listening at ', SERVER, '/', self.port)
+            log.info(f"Listening at {SERVER}:{self.port}")
         except socket.error:
-            print('Error binding server to ip and port')
+            log.error('Error binding server to ip and port')
             self.serversocket.close()
 
     # Runs a loop running serversocket.accept to fetch client info and assign a thread to it.
     def _accept_clients(self):
         while True:
-            print(f"Num of clients: {self.numOfClients}")
             try:
                 conn, addr = self.serversocket.accept()
                 self.numOfClients += 1
                 if self.numOfClients <= self.MAX_NUM_CONN:
                     Thread(target=self.threaded_handle_client, args=(
-                        conn, addr)).start()
+                        conn, addr), daemon=True).start()
                 else:
+                    self.register_connection(conn)
                     response = {
                         'header': HEADER,
                         'type': "NO",
                         'content': None
                     }
                     self.numOfClients -= 1
-                    print("A client is trying to connect but the server is full.")
+                    log.warning(
+                        "A client tried to connect but the server is full.")
                     self.send(conn, response)
-
+                    self._locks.pop(conn, None)
             except socket.error:
-                print('Error establishing connection with client')
+                log.error('Error establishing connection with client')
                 break
 
     # Serializes a dictionary with pickle and sends it to the client using a
     # 4-byte big-endian length prefix so the receiver knows exactly how many
     # bytes make up one message. This prevents messages from being split or
-    # merged on the TCP stream.
+    # merged on the TCP stream. The per-connection lock guarantees that two
+    # threads never write a half message to the same socket at once.
     def send(self, conn, data):
         serializedData = pickle.dumps(data)
-        conn.sendall(struct.pack('>I', len(serializedData)) + serializedData)
+        framed = struct.pack('>I', len(serializedData)) + serializedData
+        lock = self._locks.get(conn)
+        if lock is not None:
+            with lock:
+                conn.sendall(framed)
+        else:
+            conn.sendall(framed)
 
     # Reads exactly n bytes from the socket, or returns None if the peer
     # closes the connection before n bytes arrive.
@@ -210,7 +221,7 @@ class Server(object):
     # Sends the client id and waits for a HELLO name send.
     def sendClientId(self, conn, id):
         request = {
-            'header': 4096,
+            'header': HEADER,
             'type': "HELLO",
             'content': id
         }
@@ -219,13 +230,13 @@ class Server(object):
     # Recieves the client's Name
     def receiveClientName(self, conn, id):
         data = self.receive(conn)
-        if data['type'] == "HELLO":
+        if data is not None and data['type'] == "HELLO":
             self.clientNames[id] = data['content']
 
     # Send ok to client
     def sendOk(self, conn):
         request = {
-            'header': 4096,
+            'header': HEADER,
             'type': "OK",
             'content': None
         }
@@ -239,8 +250,10 @@ class Server(object):
 
 # File starts here.
 if __name__ == '__main__':
-    print('Server is starting....')
-    print(f'Clients on this machine can connect using IP 127.0.0.1 and port {PORT}')
-    print(f'Clients on your LAN can connect using IP {SERVER} and port {PORT}')
+    log.info('Server is starting....')
+    log.info(
+        f'Clients on this machine can connect using IP 127.0.0.1 and port {PORT}')
+    log.info(
+        f'Clients on your LAN can connect using IP {SERVER} and port {PORT}')
     server = Server()
     server.run()

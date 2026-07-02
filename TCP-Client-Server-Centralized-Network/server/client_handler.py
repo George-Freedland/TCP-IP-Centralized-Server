@@ -2,13 +2,15 @@
 # File:             client_handler.py
 # Author:           George Freedland
 # Purpose:          CSC645 Assigment #1 TCP socket programming
-# Description:      Template ClientHandler class.
-# Running:          Python 2: python server.py
-#                   Python 3: python3 server.py
+# Description:      Handles a single client connection on the server.
+# Running:          python3 server.py
 #                   Note: Must run the server before the client.
 ########################################################################
-import pickle
 import socket
+import pickle
+import logging
+
+log = logging.getLogger('server')
 
 HEADER = 4096  # header length
 
@@ -31,6 +33,9 @@ class ClientHandler(object):
         self.clientId = addr[1]
         self.server = server_instance
         self.conn = conn
+        # Register the per-connection send lock before any data is sent so
+        # that every write to this socket is serialized.
+        server_instance.register_connection(conn)
         server_instance.clientHandlerObjects[addr[1]] = conn
 
         # Send the clientId to the client and receive the name back, then send an ok response.
@@ -39,7 +44,7 @@ class ClientHandler(object):
         server_instance.sendOk(conn)
 
         self.clientNames = server_instance.clientNames
-        self.clientName = server_instance.clientNames[addr[1]]
+        self.clientName = server_instance.clientNames.get(addr[1], str(addr[1]))
         self.unreadMessages = server_instance.unreadMessages
         self.myRoomId = None
 
@@ -48,8 +53,6 @@ class ClientHandler(object):
         Sends the menu options to the client after the handshake between client and server is done.
         :return: VOID
         """
-        # menu = Menu({'option 1': 'test1', 'option 2': 'test2'})
-        # menu = Menu()
         infoNeeded = {
             'menuOption': ['int', 'Please enter a menu option: ']
         }
@@ -66,7 +69,6 @@ class ClientHandler(object):
         """
         Process the option selected by the user and the data sent by the client related to that
         option. Note that validation of the option selected must be done in client and server.
-        In this method, I already implemented the server validation of the option selected.
         :param data: the MENUOPTION message sent by this client.
         :return:
         """
@@ -92,6 +94,8 @@ class ClientHandler(object):
                 response['infoNeeded'] = infoNeeded
                 self.server.send(self.conn, response)
                 clientResponse = self.server.receive(self.conn)
+                if clientResponse is None:
+                    return
                 recipientId = clientResponse['recipientId']
                 message = clientResponse['message']
                 self._send_message(recipientId, message)
@@ -99,13 +103,14 @@ class ClientHandler(object):
                 self._show_messages()
             elif option == 4:
                 infoNeeded = {
-                    'myRoomId': ["int", "Enter the room id you want to create(You only get one): "]
+                    'myRoomId': ["int", "Enter the room id you want to create: "]
                 }
                 response['infoNeeded'] = infoNeeded
                 self.server.send(self.conn, response)
                 clientResponse = self.server.receive(self.conn)
-                myRoomId = clientResponse['myRoomId']
-                self._create_chat(myRoomId)
+                if clientResponse is None:
+                    return
+                self._create_chat(clientResponse['myRoomId'])
             elif option == 5:
                 infoNeeded = {
                     'joinRoomId': ["int", "Enter the room id you want to join: "]
@@ -113,8 +118,9 @@ class ClientHandler(object):
                 response['infoNeeded'] = infoNeeded
                 self.server.send(self.conn, response)
                 clientResponse = self.server.receive(self.conn)
-                joinRoomId = clientResponse['joinRoomId']
-                self._join_chat(joinRoomId)
+                if clientResponse is None:
+                    return
+                self._join_chat(clientResponse['joinRoomId'])
             elif option == 6:
                 infoNeeded = {
                     'broadcastMessage': ["string", "Enter the message to broadcast to all users: "]
@@ -122,27 +128,31 @@ class ClientHandler(object):
                 response['infoNeeded'] = infoNeeded
                 self.server.send(self.conn, response)
                 clientResponse = self.server.receive(self.conn)
+                if clientResponse is None:
+                    return
                 self._broadcast_message(clientResponse['broadcastMessage'])
             elif option == 7:
                 self._disconnect_from_server()
         else:
-            print("The option selected is invalid")
+            log.warning(f"Client {self.clientId} selected an invalid option")
             self._sendMenu()
 
     # When a DONE type is sent, the content is displayed. clientNames is updated at every login/logout.
     def _send_user_list(self):
-        print('Sending user list')
+        log.info(f"Sending user list to {self.clientName}")
 
+        users = "\n".join(
+            f"  id {cid}: {name}" for cid, name in self.clientNames.items())
         data = {
             'header': HEADER,
             'type': "DONE",
-            'content': 'Users in the server: ' + str(self.clientNames)
+            'content': 'Users in the server:\n' + users
         }
         self.server.send(self.conn, data)
         return None
 
-    # If the recipient id is valid we send a message and confirm to the client the message to the id was send
-    # Otherwise sends a "recipient not found" message to client so the client must select the sendmessage option again.
+    # Delivers a direct message to a recipient in real time (if connected) and
+    # stores it in the mailbox so it can also be read later via option 3.
     def _send_message(self, recipientId, message):
         # Normalize to int so it matches the integer client ids used as keys
         # in clientNames and compared against in _show_messages.
@@ -151,18 +161,26 @@ class ClientHandler(object):
         except (TypeError, ValueError):
             recipientId = None
 
-        if (recipientId in self.clientNames.keys()):
-            print("This recipient exists.")
+        if recipientId in self.clientNames.keys():
+            log.info(f"{self.clientName} -> {recipientId}: {message}")
             self.unreadMessages.append({
-                'recipient': recipientId, 'messagecontent': message, 'sender': self.clientId, 'unread': True})
+                'recipient': recipientId, 'messagecontent': message,
+                'sender': self.clientId, 'unread': True})
+
+            # Push the message to the recipient right now if they're connected.
+            recipient_conn = self.server.clientHandlerObjects.get(recipientId)
+            if recipient_conn is not None:
+                self._push(recipient_conn,
+                           f"[Message from {self.clientName}] {message}")
+
             data = {
                 'header': HEADER,
                 'type': "DONE",
-                'content': 'Message Sent To: ' + str(recipientId) + '\nMessage: ' + message
+                'content': f'Message sent to id {recipientId}: {message}'
             }
             self.server.send(self.conn, data)
         else:
-            print("This recipient does NOT exist.")
+            log.info(f"{self.clientName} tried to message unknown id {recipientId}")
             data = {
                 'header': HEADER,
                 'type': "DONE",
@@ -172,36 +190,40 @@ class ClientHandler(object):
 
     def _broadcast_message(self, message):
         """
-        Sends a message from this client to every client currently connected
-        to the server (including the sender, so they get confirmation).
-
-        Each connected client is stored in server.clientHandlerObjects as
-        {clientId: connectionSocket}. We iterate over a snapshot of that
-        dictionary so that clients connecting/disconnecting mid-broadcast
-        don't cause a "dictionary changed size during iteration" error.
+        Sends a message from this client to every other connected client in
+        real time. The sender gets a confirmation instead of the push so the
+        message isn't shown twice on their screen.
         :param message: the text to broadcast.
         :return: VOID
         """
         broadcastContent = f"[BROADCAST] {self.clientName}: {message}"
-        print(f"Broadcasting message from {self.clientName}: {message}")
-
-        data = {
-            'header': HEADER,
-            'type': "DONE",
-            'content': broadcastContent
-        }
+        log.info(f"Broadcast from {self.clientName}: {message}")
 
         for recipientId, conn in list(self.server.clientHandlerObjects.items()):
-            try:
-                self.server.send(conn, data)
-            except (socket.error, OSError):
-                # Skip clients that have already disconnected.
-                print(f"Could not deliver broadcast to client {recipientId}.")
+            if recipientId == self.clientId:
+                continue
+            self._push(conn, broadcastContent)
+
+        self.server.send(self.conn, {
+            'header': HEADER,
+            'type': "DONE",
+            'content': f'Broadcast sent to all users: {message}'
+        })
+
+    def _push(self, conn, text):
+        """Sends an unsolicited (asynchronous) message that the receiving
+        client should display immediately, interrupting whatever prompt the
+        user is at."""
+        data = {'header': HEADER, 'type': "PUSH", 'content': text}
+        try:
+            self.server.send(conn, data)
+        except (socket.error, OSError):
+            log.warning("Could not deliver a push message (client gone).")
 
     def _show_messages(self):
         """
-        TODO: send all the unreaded messages of this client. if non unread messages found, send an empty list.
-        TODO: make sure to delete the messages from list once the client acknowledges that they were read.
+        Sends all the unread messages of this client. Messages are removed from
+        the mailbox once they've been read.
         :return: VOID
         """
         messagesToShow = ''  # String to set.
@@ -232,180 +254,154 @@ class ClientHandler(object):
         }
         self.server.send(self.conn, data)
 
+    # ------------------------------------------------------------------
+    # Chat rooms
+    #
+    # A room lives as long as it has at least one member. Any member can leave
+    # by typing 'exit' or 'bye'. Every message (and join/leave notice) is
+    # pushed to all other members in real time.
+    #
+    # chatRooms[roomId] = {
+    #     'ownerId': <creator id>,
+    #     'members': {clientId: {'name': name, 'conn': conn}},
+    #     'messages': [(senderName, text), ...],
+    # }
+    # ------------------------------------------------------------------
+    def _room_header(self, roomId):
+        room = self.server.chatRooms[roomId]
+        lines = [
+            f"----------------------- Chat Room {roomId} -----------------------",
+            "Type 'exit' or 'bye' to leave the room.",
+        ]
+        for name, text in room['messages']:
+            lines.append(f"{name}> {text}")
+        return "\n".join(lines)
+
     def _create_chat(self, myRoomId):
         """
-        TODO: Creates a new chat in this server where two or more users can share messages in real time.
-        :param room_id:
+        Creates a new chat room and drops this client into it.
+        :param myRoomId: the id for the new room.
         :return: VOID
         """
-        # Sets a clients personal room id and shows chat room created + instructions.
-        self.myRoomId = myRoomId
-        # Chatrooms Format: {'chatroomId(1234)': chatroomInfo = {'ownerId':50399,
-        #                                                         usersInChat = {'userid':'username'},
-        #                                                         messages = {'sendername': 'message'} },
-        #                    'chatroomId(2235)':...}
         if myRoomId in self.server.chatRooms.keys():
-            print('Chat room id is already being used.')
-            data = {
+            log.info(f"Chat room {myRoomId} already exists")
+            self.server.send(self.conn, {
                 'header': HEADER,
                 'type': "DONE",
                 'content': "Chat Room ID already in use."
-            }
-            self.server.send(self.conn, data)
+            })
+            return
 
-        else:
-            usersInChat = {self.clientId: self.clientName}
-            chatroomInfo = {
-                'ownerId': self.clientId,
-                'usersInChat': usersInChat,
-                'messages': [{self.clientName: f'{self.clientName} has created chat room {myRoomId}'}]
-            }
-            self.server.chatRooms[myRoomId] = chatroomInfo
-            chatRoomContent = f'----------------------- Chat Room {myRoomId}------------------------\nType exit to close the chat room.\nChat room created by: {self.clientNames[self.clientId]}\nWaiting for other users to join....\n'
-            for x in self.server.chatRooms[myRoomId]['messages']:
-                for key, value in x.items():
-                    chatRoomContent += f'{key}>{value}'
-            data = {
-                'header': HEADER,
-                'type': "NEEDMORE",
-                'content': chatRoomContent,
-                'infoNeeded': {'chatmessage': ["string", f"{self.clientName}> "]}
-            }
-            self.server.send(self.conn, data)
-            while True:
-                try:
-                    clientResponse = self.server.receive(self.conn)
-                    self.server.chatRooms[myRoomId]['messages'].append(
-                        {self.clientName: clientResponse['chatmessage']})
-                except:
-                    print(f'{self.clientName} has disconnected')
-                    # data = {
-                    #     'header': HEADER,
-                    #     'type': "DONE",
-                    #     'content': "Disconnecting client from server and removing chat room"
-                    # }
-                    # self.server.send(self.conn, data)
-                    break
+        self.myRoomId = myRoomId
+        self.server.chatRooms[myRoomId] = {
+            'ownerId': self.clientId,
+            'members': {self.clientId: {'name': self.clientName, 'conn': self.conn}},
+            'messages': [('*', f"{self.clientName} created chat room {myRoomId}")],
+        }
+        log.info(f"{self.clientName} created chat room {myRoomId}")
 
-                if clientResponse['chatmessage'] == "exit":
-                    data = {
-                        'header': HEADER,
-                        'type': "DONE",
-                        'content': "Disconnecting client from chat room and removing chat room"
-                    }
-                    del self.server.chatRooms[myRoomId]
-                    self.server.send(self.conn, data)
-                    break
-                else:
-                    chatRoomContent = f'----------------------- Chat Room {myRoomId}------------------------\nType exit to close the chat room.\nChat room created by: {self.clientNames[self.clientId]}\nWaiting for other users to join....\n'
-                    for x in self.server.chatRooms[myRoomId]['messages']:
-                        for key, value in x.items():
-                            chatRoomContent += f'{key}>{value}\n'
-                    data = {
-                        'header': HEADER,
-                        'type': "NEEDMORE",
-                        'content': chatRoomContent,
-                        'infoNeeded': {'chatmessage': ["string", f"{self.clientName}> "]}
-                    }
-                    self.server.send(self.conn, data)
+        self.server.send(self.conn, {
+            'header': HEADER,
+            'type': "CHATSTART",
+            'content': self._room_header(myRoomId)
+        })
+        self._chat_session(myRoomId)
 
     def _join_chat(self, joinedRoom):
         """
-        TODO: join a chat in a existing room
-        :param joinedRoom:
+        Joins an existing chat room and drops this client into it.
+        :param joinedRoom: the id of the room to join.
         :return: VOID
         """
-        if (joinedRoom in self.server.chatRooms.keys()):
-            self.server.chatRooms[joinedRoom]['usersInChat'][self.clientId] = self.clientName
-
-            chatmessages = f"----------------------- Chat Room {joinedRoom} ------------------------\n"
-            chatmessages += "Type 'bye' to exit this chat room\n"
-            # Add join message to chatroom messages
-            self.server.chatRooms[joinedRoom]['messages'].append(
-                {self.clientName: f"{self.clientName} has joined chat room {joinedRoom}"})
-
-            # Display all messages
-            for x in self.server.chatRooms[joinedRoom]['messages']:
-                for key, value in x.items():
-                    chatmessages += f"{key}>{value}\n"
-
-            response = {
-                'header': HEADER,
-                'type': "NEEDMORE",
-                'content': chatmessages,
-                'infoNeeded': {'chatmessage': ["string", f"{self.clientName}> "]}
-            }
-            self.server.send(self.conn, response)
-            # Recieve connection with infoNeeded aka chat message, process that by addingto messages
-            while True:
-                try:
-                    clientResponse = self.server.receive(self.conn)
-                except:
-                    self.server.chatRooms[joinedRoom]['messages'].append(
-                        {self.clientName: f"{self.clientName} is leaving chat room {joinedRoom}"})
-                    del self.server.chatRooms[joinedRoom]['usersInChat'][self.clientId]
-                    break
-
-                chatmessage = clientResponse['chatmessage']
-                # Add the message to chatmessages response (appears to be live)
-                chatmessages = f"----------------------- Chat Room {joinedRoom} ------------------------\n"
-                chatmessages += "Type 'bye' to exit this chat room\n"
-                if joinedRoom not in self.server.chatRooms.keys():
-                    leave = {
-                        'header': HEADER,
-                        'type': "DONE",
-                        'content': None
-                    }
-                    self.server.send(self.conn, leave)
-                    break
-                self.server.chatRooms[joinedRoom]['messages'].append(
-                    {self.clientName: f"{chatmessage}"})
-                # Display all messages
-                for x in self.server.chatRooms[joinedRoom]['messages']:
-                    for key, value in x.items():
-                        chatmessages += f"{key}>{value}\n"
-                        if key == self.clientNames[self.server.chatRooms[joinedRoom]['ownerId']] and value == 'exit':
-                            leave = {
-                                'header': HEADER,
-                                'type': "DONE",
-                                'content': None
-                            }
-                            self.server.send(self.conn, leave)
-                            break
-
-                if chatmessage == "bye":
-                    self.server.chatRooms[joinedRoom]['messages'].append(
-                        {self.clientName: f"{self.clientName} is leaving chat room {joinedRoom}"})
-                    del self.server.chatRooms[joinedRoom]['usersInChat'][self.clientId]
-                    leave = {
-                        'header': HEADER,
-                        'type': "DONE",
-                        'content': None
-                    }
-                    self.server.send(self.conn, leave)
-                    break
-
-                else:
-                    needmore = {
-                        'header': HEADER,
-                        'type': "NEEDMORE",
-                        'content': chatmessages,
-                        'infoNeeded': {'chatmessage': ["string", f"{self.clientName}> "]}
-                    }
-                    self.server.send(self.conn, needmore)
-
-        else:
-            print("This chat room does NOT exist.")
-            response = {
+        if joinedRoom not in self.server.chatRooms.keys():
+            log.info(f"{self.clientName} tried to join unknown room {joinedRoom}")
+            self.server.send(self.conn, {
                 'header': HEADER,
                 'type': "DONE",
                 'content': 'The chat room you entered does not exist'
-            }
-            self.server.send(self.conn, response)
+            })
+            return
+
+        room = self.server.chatRooms[joinedRoom]
+        room['members'][self.clientId] = {
+            'name': self.clientName, 'conn': self.conn}
+        room['messages'].append(
+            ('*', f"{self.clientName} joined the room"))
+        log.info(f"{self.clientName} joined chat room {joinedRoom}")
+
+        # Let everyone already in the room know, in real time.
+        self._push_to_room(
+            joinedRoom, f"*** {self.clientName} joined the room ***",
+            exclude=self.clientId)
+
+        self.server.send(self.conn, {
+            'header': HEADER,
+            'type': "CHATSTART",
+            'content': self._room_header(joinedRoom)
+        })
+        self._chat_session(joinedRoom)
+
+    def _chat_session(self, roomId):
+        """
+        Blocking loop (runs in this client's thread) that reads chat lines from
+        the client and pushes them to the rest of the room until the client
+        leaves or disconnects.
+        """
+        while True:
+            try:
+                resp = self.server.receive(self.conn)
+            except (socket.error, EOFError, pickle.UnpicklingError):
+                resp = None
+
+            # Client disconnected mid-chat: leave the room and let the outer
+            # handler loop perform the final cleanup.
+            if resp is None:
+                self._leave_room(roomId)
+                return
+
+            text = str(resp.get('content', '')).strip()
+
+            if text.lower() in ('exit', 'bye'):
+                self._leave_room(roomId)
+                return
+
+            room = self.server.chatRooms.get(roomId)
+            if room is None:
+                return
+
+            room['messages'].append((self.clientName, text))
+            self._push_to_room(
+                roomId, f"{self.clientName}> {text}", exclude=self.clientId)
+
+    def _leave_room(self, roomId):
+        room = self.server.chatRooms.get(roomId)
+        if not room:
+            return
+
+        room['members'].pop(self.clientId, None)
+        log.info(f"{self.clientName} left chat room {roomId}")
+
+        if room['members']:
+            room['messages'].append(
+                ('*', f"{self.clientName} left the room"))
+            self._push_to_room(
+                roomId, f"*** {self.clientName} left the room ***")
+        else:
+            del self.server.chatRooms[roomId]
+            log.info(f"Chat room {roomId} is empty and was removed")
+
+    def _push_to_room(self, roomId, text, exclude=None):
+        room = self.server.chatRooms.get(roomId)
+        if not room:
+            return
+        for memberId, info in list(room['members'].items()):
+            if memberId == exclude:
+                continue
+            self._push(info['conn'], text)
 
     def delete_client_data(self):
         """
-        TODO: delete all the data related to this client from the server.
+        Clears the references this handler holds for the client.
         :return: VOID
         """
         self.serverIp = None
@@ -416,14 +412,11 @@ class ClientHandler(object):
 
     def _disconnect_from_server(self):
         """
-        TODO: call delete_client_data() method, and then, disconnect this client from the server.
+        Acknowledges the client's disconnect request and clears its data.
         :return: VOID
         """
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        print(
-            f'Disconnecting user: {self.clientNames[self.clientId]} {self.serverIp}/{self.clientId}')
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-        # Sets up exit acknowledgement to client and closed the socket breaks the loop for the thread
+        log.info(
+            f"Disconnecting user: {self.clientName} {self.serverIp}/{self.clientId}")
         data = {
             'header': HEADER,
             'type': "EXIT",
