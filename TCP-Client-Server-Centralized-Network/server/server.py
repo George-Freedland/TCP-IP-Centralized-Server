@@ -8,27 +8,47 @@
 #                   Note: Must run the server before the client.
 ########################################################################
 
-from builtins import object
 import socket
-from threading import Thread, activeCount
-# import threading
+import struct
+from threading import Thread, active_count
 import pickle
 from client_handler import ClientHandler
 
-# 192.168.56.1 Ethernet adapter VirtualBox Host-Only Network
-
 PORT = 12000
-SERVER = socket.gethostbyname(socket.gethostname())
-ADDR = (SERVER, PORT)
+# Bind to all interfaces so the server is reachable via 127.0.0.1 and the
+# machine's LAN IP when testing locally.
+BIND_HOST = "0.0.0.0"
+
+
+def _get_lan_ip():
+    """Best-effort LAN IP for display only. Falls back to 127.0.0.1 on
+    machines where the hostname does not resolve."""
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except socket.error:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except socket.error:
+            return "127.0.0.1"
+
+
+# The LAN IP is only used for display so clients know where to connect.
+SERVER = _get_lan_ip()
+ADDR = (BIND_HOST, PORT)
 HEADER = 4096
 
 
 class Server(object):
 
     MAX_NUM_CONN = 10  # keeps 10 clients in queue
+    DISCONNECT_OPTION = 7  # menu option that closes a client's session
 
     # GENERAL SERVER INITIALIZATION - init local variables, create and bind socket.
-    def __init__(self, ip_address=SERVER, port=PORT):
+    def __init__(self, ip_address=BIND_HOST, port=PORT):
         self.host = ip_address
         self.port = port
         self.numOfClients = 0
@@ -48,6 +68,9 @@ class Server(object):
         try:
             self.serversocket = socket.socket(
                 socket.AF_INET, socket.SOCK_STREAM)
+            # Allow quick restarts without hitting "address already in use".
+            self.serversocket.setsockopt(
+                socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         except socket.error:
             print('Error creating socket.')
 
@@ -63,28 +86,30 @@ class Server(object):
         # On init this sets up variables in ClientHandler.
         # Also sends ID, gets Name then sends Ok
         client_handler = ClientHandler(self, conn, addr)
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
         print(f"NEW CONNECTION from {addr} had been established!")
-        print(f"Active Connections/Threads Running: {activeCount() - 1}")
-        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
+        print(f"Active Connections/Threads Running: {active_count() - 1}")
+        print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
         # Main recieve loop determines what to do based on the 'type'
         while self.connected:
             try:
                 message = self.receive(conn)
-                self.clientRequest = message  # Sets globally so client handler can use
-            except socket.error:
+            except (socket.error, EOFError, pickle.UnpicklingError):
+                message = None
+
+            # A None message means the client closed the connection.
+            if message is None:
                 self.numOfClients -= 1
                 print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
                 print(
-                    f"{self.clientNames[addr[1]]} has disconnected from the server.")
+                    f"{self.clientNames.get(addr[1], addr[1])} has disconnected from the server.")
                 print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
                 break
 
             # Give some data about the incoming message
             print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
             print(
-                # f"Incoming message from {addr}\nMessage Header: {message['header']}\nMessage Type: {message['type']}\nMessage Content: {message['content']}")
                 f"Incoming message from {addr}\nMessage Header: {message['header']}\nMessage Type: {message['type']}")
             print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
@@ -101,20 +126,27 @@ class Server(object):
                 print(
                     f"Handle menu request {message['menuOption']} from {addr}...")
                 print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
-                client_handler.process_options()
-                if message['menuOption'] == 6:
+                # Pass the message explicitly so concurrent clients don't
+                # clobber each other through a shared server attribute.
+                client_handler.process_options(message)
+                if message['menuOption'] == self.DISCONNECT_OPTION:
                     self.numOfClients -= 1
                     break
 
-        # Runs clear/close on client connection
-        self.clientNames.pop(addr[1])  # Removes from clientNames
-        self.clientHandlerObjects[addr[1]].close()  # Closed connection
-        self.clientHandlerObjects.pop(addr[1])  # Removes connection
+        # Runs clear/close on client connection (guarded so an abrupt
+        # disconnect can't raise KeyError during cleanup).
+        self.clientNames.pop(addr[1], None)
+        conn_to_close = self.clientHandlerObjects.pop(addr[1], None)
+        if conn_to_close is not None:
+            try:
+                conn_to_close.close()
+            except socket.error:
+                pass
 
     # Listens to new clients and sets max clients to MAX_NUM_CONN
     def _listen(self):
         try:
-            self.serversocket.listen(1)
+            self.serversocket.listen(self.MAX_NUM_CONN)
             print('Listening at ', SERVER, '/', self.port)
         except socket.error:
             print('Error binding server to ip and port')
@@ -144,16 +176,35 @@ class Server(object):
                 print('Error establishing connection with client')
                 break
 
-    # Serializes dictionary with pickle and send to client.
+    # Serializes a dictionary with pickle and sends it to the client using a
+    # 4-byte big-endian length prefix so the receiver knows exactly how many
+    # bytes make up one message. This prevents messages from being split or
+    # merged on the TCP stream.
     def send(self, conn, data):
         serializedData = pickle.dumps(data)
-        conn.send(serializedData)
+        conn.sendall(struct.pack('>I', len(serializedData)) + serializedData)
 
-   # Receives serliazed data with MAX_BUFFER_SIZE limit
-   # deserializes the data into a dictionary with pickle.
-   # Returns
-    def receive(self, conn, MAX_BUFFER_SIZE=4096):
-        raw_data = conn.recv(MAX_BUFFER_SIZE)
+    # Reads exactly n bytes from the socket, or returns None if the peer
+    # closes the connection before n bytes arrive.
+    def _recv_all(self, conn, n):
+        buffer = bytearray()
+        while len(buffer) < n:
+            chunk = conn.recv(n - len(buffer))
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+        return bytes(buffer)
+
+    # Receives one length-prefixed message and deserializes it with pickle.
+    # Returns None when the client has disconnected.
+    def receive(self, conn):
+        raw_length = self._recv_all(conn, 4)
+        if raw_length is None:
+            return None
+        message_length = struct.unpack('>I', raw_length)[0]
+        raw_data = self._recv_all(conn, message_length)
+        if raw_data is None:
+            return None
         return pickle.loads(raw_data)
 
     # Sends the client id and waits for a HELLO name send.
@@ -186,8 +237,10 @@ class Server(object):
         self._accept_clients()
 
 
-# File Startes here.
+# File starts here.
 if __name__ == '__main__':
     print('Server is starting....')
+    print(f'Clients on this machine can connect using IP 127.0.0.1 and port {PORT}')
+    print(f'Clients on your LAN can connect using IP {SERVER} and port {PORT}')
     server = Server()
     server.run()

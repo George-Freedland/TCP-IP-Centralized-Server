@@ -8,8 +8,9 @@
 #                   Note: Must run the server before the client.
 ########################################################################
 import pickle
+import socket
 
-HEADER = 1024  # header length
+HEADER = 4096  # header length
 
 
 class ClientHandler(object):
@@ -56,20 +57,19 @@ class ClientHandler(object):
         data = {
             'header': HEADER,
             'type': "NEEDMORE",
-            'content': "****** TCP Message App *******\nOptions Available: \n1. Get user list\n2. Send a message\n3. Get my messages\n4. Create a new chat room\n5. Join an existing chat room\n6. Disconnect from server",
+            'content': "****** TCP Message App *******\nOptions Available: \n1. Get user list\n2. Send a message\n3. Get my messages\n4. Create a new chat room\n5. Join an existing chat room\n6. Broadcast a message to all users\n7. Disconnect from server",
             'infoNeeded': infoNeeded
         }
         self.server.send(self.conn, data)
 
-    def process_options(self):
+    def process_options(self, data):
         """
         Process the option selected by the user and the data sent by the client related to that
         option. Note that validation of the option selected must be done in client and server.
         In this method, I already implemented the server validation of the option selected.
+        :param data: the MENUOPTION message sent by this client.
         :return:
         """
-        data = self.server.clientRequest
-
         response = {
             'header': HEADER,
             'type': "NEEDMORE",
@@ -78,9 +78,9 @@ class ClientHandler(object):
         }
 
         # validates a valid option selected and runs appropriate method.
-        # Runs if-else on menuOption (value between 1-6 inclusive), prepares either a DONE (client will ask for menu)
+        # Runs if-else on menuOption (value between 1-7 inclusive), prepares either a DONE (client will ask for menu)
         # or NEEDMORE with infoNeeded questions dictionary (key: question to get value)
-        if 'menuOption' in data.keys() and 1 <= data['menuOption'] <= 6:
+        if 'menuOption' in data.keys() and 1 <= data['menuOption'] <= 7:
             option = data['menuOption']
             if option == 1:
                 self._send_user_list()
@@ -116,6 +116,14 @@ class ClientHandler(object):
                 joinRoomId = clientResponse['joinRoomId']
                 self._join_chat(joinRoomId)
             elif option == 6:
+                infoNeeded = {
+                    'broadcastMessage': ["string", "Enter the message to broadcast to all users: "]
+                }
+                response['infoNeeded'] = infoNeeded
+                self.server.send(self.conn, response)
+                clientResponse = self.server.receive(self.conn)
+                self._broadcast_message(clientResponse['broadcastMessage'])
+            elif option == 7:
                 self._disconnect_from_server()
         else:
             print("The option selected is invalid")
@@ -136,7 +144,14 @@ class ClientHandler(object):
     # If the recipient id is valid we send a message and confirm to the client the message to the id was send
     # Otherwise sends a "recipient not found" message to client so the client must select the sendmessage option again.
     def _send_message(self, recipientId, message):
-        if (int(recipientId) in self.clientNames.keys()):
+        # Normalize to int so it matches the integer client ids used as keys
+        # in clientNames and compared against in _show_messages.
+        try:
+            recipientId = int(recipientId)
+        except (TypeError, ValueError):
+            recipientId = None
+
+        if (recipientId in self.clientNames.keys()):
             print("This recipient exists.")
             self.unreadMessages.append({
                 'recipient': recipientId, 'messagecontent': message, 'sender': self.clientId, 'unread': True})
@@ -155,6 +170,34 @@ class ClientHandler(object):
             }
             self.server.send(self.conn, data)
 
+    def _broadcast_message(self, message):
+        """
+        Sends a message from this client to every client currently connected
+        to the server (including the sender, so they get confirmation).
+
+        Each connected client is stored in server.clientHandlerObjects as
+        {clientId: connectionSocket}. We iterate over a snapshot of that
+        dictionary so that clients connecting/disconnecting mid-broadcast
+        don't cause a "dictionary changed size during iteration" error.
+        :param message: the text to broadcast.
+        :return: VOID
+        """
+        broadcastContent = f"[BROADCAST] {self.clientName}: {message}"
+        print(f"Broadcasting message from {self.clientName}: {message}")
+
+        data = {
+            'header': HEADER,
+            'type': "DONE",
+            'content': broadcastContent
+        }
+
+        for recipientId, conn in list(self.server.clientHandlerObjects.items()):
+            try:
+                self.server.send(conn, data)
+            except (socket.error, OSError):
+                # Skip clients that have already disconnected.
+                print(f"Could not deliver broadcast to client {recipientId}.")
+
     def _show_messages(self):
         """
         TODO: send all the unreaded messages of this client. if non unread messages found, send an empty list.
@@ -168,18 +211,18 @@ class ClientHandler(object):
             # Display all unread messages pertaining to user, using a count variable to display amount of unread messages.
             if (x['recipient'] == self.clientId and x['unread'] == True):
                 count += 1
+                sender_name = self.clientNames.get(x['sender'], x['sender'])
                 messagesToShow += ("Message: " +
-                                   str(x['messagecontent']) + " From: " + self.clientNames[x['sender']] + "\n")
+                                   str(x['messagecontent']) + " From: " + str(sender_name) + "\n")
                 x['unread'] = False
 
         messagesToShow = f"You have {count} unread messages\n" + \
             messagesToShow
 
-        # Delete all the read messages
-        for x in self.unreadMessages:
-            if x['unread'] == False:
-                count -= 1
-                self.unreadMessages.remove(x)
+        # Keep only messages that are still unread. Rebuilding the list in
+        # place avoids mutating it while iterating (which skips elements).
+        self.unreadMessages[:] = [
+            m for m in self.unreadMessages if m['unread']]
 
         # Send Done request with content
         data = {

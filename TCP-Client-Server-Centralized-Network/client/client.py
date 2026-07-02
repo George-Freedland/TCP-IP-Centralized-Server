@@ -8,6 +8,7 @@
 #
 ########################################################################
 import socket
+import struct
 import pickle
 
 # Constants:
@@ -102,7 +103,7 @@ class Client(object):
                     print("~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~")
 
                 # Gets the options and sets the dictionary request up
-                infoNeeded = data['infoNeeded']
+                infoNeeded = data.get('infoNeeded') or {}
                 for key, value in infoNeeded.items():
                     if value[0] == "int":
                         correct = False
@@ -166,6 +167,9 @@ class Client(object):
         """
         while True:
             data = self.receive()  # deserialized data
+            if data is None:
+                print('Lost connection to server during handshake.')
+                break
             # extracts and sets the client id to this client
             if data['type'] == "HELLO":
                 self.clientId = data['content']
@@ -200,6 +204,9 @@ class Client(object):
     def waitForOk(self):
         while True:
             data = self.receive()  # deserialized data
+            if data is None:
+                print('Lost connection to server while waiting for acknowledgement.')
+                break
             if data['type'] == "OK":
                 break
             elif data['type'] == "NACK":
@@ -222,30 +229,52 @@ class Client(object):
 
     def send(self, data):
         """
-        TODO: Serializes and then sends data to server
+        Serializes and then sends data to the server using a 4-byte
+        big-endian length prefix so the server can read exactly one message.
         :param data:
         :return:
         """
-        data = pickle.dumps(data)  # serialized data
+        payload = pickle.dumps(data)  # serialized data
         try:
-            self.clientSocket.send(data)
+            self.clientSocket.sendall(struct.pack('>I', len(payload)) + payload)
         except socket.error:
             print('Error with socket send.')
             return
 
-    def receive(self, MAX_BUFFER_SIZE=4090):
+    def _recv_all(self, n):
         """
-        TODO: Desearializes the data received by the server
-        :param MAX_BUFFER_SIZE: Max allowed allocated memory for this data
-        :return: the deserialized data.
+        Reads exactly n bytes from the socket, or returns None if the server
+        closes the connection before n bytes arrive.
         """
-        try:
-            # deserializes the data from server
-            raw_data = self.clientSocket.recv(MAX_BUFFER_SIZE)
-        except socket.error:
-            print('Error receiving data.')
+        buffer = bytearray()
+        while len(buffer) < n:
+            try:
+                chunk = self.clientSocket.recv(n - len(buffer))
+            except socket.error:
+                print('Error receiving data.')
+                return None
+            if not chunk:
+                return None
+            buffer.extend(chunk)
+        return bytes(buffer)
+
+    def receive(self):
+        """
+        Reads one length-prefixed message and deserializes it with pickle.
+        :return: the deserialized data, or None if the server disconnected.
+        """
+        raw_length = self._recv_all(4)
+        if raw_length is None:
             return None
-        return pickle.loads(raw_data)
+        message_length = struct.unpack('>I', raw_length)[0]
+        raw_data = self._recv_all(message_length)
+        if raw_data is None:
+            return None
+        try:
+            return pickle.loads(raw_data)
+        except pickle.UnpicklingError:
+            print('Error deserializing data from server.')
+            return None
 
     def close(self):
         """
